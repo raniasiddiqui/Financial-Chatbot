@@ -7,7 +7,14 @@ import pandas as pd
 import spacy
 from sklearn.preprocessing import LabelEncoder  # Ensure LabelEncoder is imported
 from transformers import BertTokenizer, BertForSequenceClassification
+from word2number import w2n
 import re
+from datetime import datetime, timedelta
+import re
+from dateutil.relativedelta import relativedelta
+import sqlite3
+from datetime import datetime
+import requests
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
@@ -58,16 +65,24 @@ def classify_intent(query):
     logging.debug(f"Classified intent: {classified_intent}")
     return classified_intent
 
-# def extract_entities(text):
-#     logging.debug(f"Extracting entities from text: {text}")
-#     doc = nlp(text)
-#     entities = {ent.label_: ent.text for ent in doc.ents}
-#     if "PERSON" not in entities:
-#         match = re.search(r'\bto\s+([A-Z][a-z]+)\b', text)
-#         if match:
-#             entities["PERSON"] = match.group(1)
-#     logging.debug(f"Extracted entities: {entities}")
-#     return entities
+# def parse_with_duckling(text):
+#     url = "http://localhost:8000/parse"
+#     data = {
+#         "text": text,
+#         "locale": "en_US",
+#         "tz": "UTC"
+#     }
+#     headers = {
+#         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+#     }
+
+#     response = requests.post(url, data=data, headers=headers)
+#     if response.status_code == 200:
+#         return response.json()
+#     else:
+#         logging.error(f"Duckling request failed with status code {response.status_code}")
+#         return None
+
 
 def extract_entities(text):
     # logging.debug(f"Extracting entities from text: {text}")
@@ -86,9 +101,104 @@ def extract_entities(text):
     
     return entities
 
+def convert_written_numbers_to_digits(text):
+    words = text.split()
+    converted_words = []
+    for word in words:
+        try:
+            number = w2n.word_to_num(word)
+            converted_words.append(str(number))
+        except ValueError:
+            converted_words.append(word)
+    return ' '.join(converted_words)
+# Load spaCy model
+nlp = spacy.load('en_core_web_sm')
+# Function to extract and parse temporal expressions
+def extract_dates_from_query(query):
+    # Process the query with spaCy
+    doc = nlp(query)
+
+    # Extract temporal expressions
+    date_expressions = []
+    for ent in doc.ents:
+        if ent.label_ in ('DATE', 'TIME'):
+            date_expressions.append(ent.text)
+
+    return date_expressions
+
+def get_date_range_from_expression(expression):
+    now = datetime.now()
+    start_date = None
+    end_date = None
+
+    # Convert written numbers to digits
+    expression = convert_written_numbers_to_digits(expression)
+
+    # Use regex to find the numeric and temporal components
+    match = re.search(r'last\s*(\d*)\s*(day|week|month|year)s?', expression.lower())
+    if match:
+        number = int(match.group(1)) if match.group(1) else 1
+        unit = match.group(2)
+
+        if unit == 'day':
+            end_date = now - timedelta(days=1)
+            start_date = end_date - timedelta(days=number - 1)
+        elif unit == 'week':
+            end_date = now - timedelta(days=now.weekday() + 1)
+            start_date = end_date - timedelta(weeks=number - 1, days=6)
+        elif unit == 'month':
+            end_date = now.replace(day=1) - timedelta(days=1)
+            start_date = end_date - relativedelta(months=number-1)
+            start_date = start_date.replace(day=1)
+        elif unit == 'year':
+            end_date = now.replace(month=1, day=1) - timedelta(days=1)
+            start_date = end_date - relativedelta(years=number-1)
+            start_date = start_date.replace(month=1, day=1)
+
+    print(f"Expression: {expression}, Start Date: {start_date}, End Date: {end_date}")
+    return start_date, end_date
+
+def fetch_transactions_by_name_and_date_expr(sender_surname, date_expr, db_path=r"C:\Users\Lenovo\Downloads\chatbot_tranc.db"):
+    # Extract dates from the query
+    date_expressions = extract_dates_from_query(date_expr)
+    if not date_expressions:
+        return []
+
+    results = []
+    for expression in date_expressions:
+        start_date, end_date = get_date_range_from_expression(expression)
+        if not start_date or not end_date:
+            continue
+
+        # Convert the target dates to string format
+        start_date_str = start_date.strftime('%Y-%m-%d')
+        end_date_str = end_date.strftime('%Y-%m-%d')
+
+        # Create a connection to the SQLite database
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Define the query to fetch transactions by name and date range
+        query = '''
+        SELECT * FROM transactions
+        WHERE sender_surname = ? AND transaction_date BETWEEN ? AND ?
+        '''
+
+        # Execute the query with the name and date parameters
+        cursor.execute(query, (sender_surname, start_date_str, end_date_str))
+
+        # Fetch all matching rows
+        rows = cursor.fetchall()
+        results.extend(rows)
+
+        # Close the connection
+        conn.close()
+
+    return results
+
 def fetch_customer_balance(surname):
     logging.debug(f"Fetching customer balance for surname: {surname}")
-    conn = sqlite3.connect('chatbot.db')
+    conn = sqlite3.connect(r"C:\Users\Lenovo\Downloads\chatbot_tranc.db")
     c = conn.cursor()
     c.execute('SELECT Balance FROM customers WHERE Surname = ?', (surname,))
     result = c.fetchone()
@@ -102,7 +212,7 @@ def fetch_customer_balance(surname):
 
 def transfer_money(name, receiver_name, amount):
     logging.debug(f"Transferring money from {name} to {receiver_name} amount: {amount}")
-    conn = sqlite3.connect('chatbot.db')
+    conn = sqlite3.connect(r"C:\Users\Lenovo\Downloads\chatbot_tranc.db")
     c = conn.cursor()
 
     # Fetch sender's balance by surname
@@ -175,6 +285,10 @@ def generate_response(user_input, name):
             return transfer_money(name, receiver_name, amount)
         else:
             return "Please provide receiver's name and amount to transfer."
+    elif intent == "search_transactions":
+        sender_surname = session_data.get("PERSON", name)
+        date_expr = user_input  # We assume the date expression is part of the user input
+        return fetch_transactions_by_name_and_date_expr(sender_surname, date_expr)
     elif intent == "check_human":
         return "I am an AI created to assist you with financial inquiries."
     elif intent == 'open_account':
